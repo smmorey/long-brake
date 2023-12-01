@@ -239,7 +239,7 @@ class Brake(object):
         self.upstream_edges_of_cell = self.cell_centers - (dx / 2)
         self.downstream_edges_of_cell = self.cell_centers + (dx / 2)
         #self.surface_elev = -initial_slope * cell_indices * dx + starting_height_adjustment #starting surface elevation (m) SMM: this is what I could change
-        self.surface_elev = np.load('full_8ma_profile_20ky_repeat.npy')
+        self.surface_elev = np.load('long_prof_3000m_equil.npy')
 
     def instantiate_tracking_matrix(self, number_of_blocks, gamma, starting_dist, fluvial_block_k):    # SMM: this is what I change for initial distributions
         number_of_blocks = int(number_of_blocks)
