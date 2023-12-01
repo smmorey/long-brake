@@ -13,8 +13,10 @@ added depositional block event capabilities.
 #Packages:
 from __future__ import division
 import numpy as np
+import pickle
 import sys
 import os
+from numpy.random import Generator, PCG64
 np.set_printoptions(threshold=np.inf)
 
 class Brake(object):
@@ -82,57 +84,105 @@ class Brake(object):
         adjusted_shear_stress = pre_adjusted_tau / (1 + sigma_d_blocks)
         return adjusted_shear_stress
         
-    def roughness_bisection(self, q, s, d, g):
+    def roughness_bisection(self, q, s, z0, g, cd, tracking_mat, dx, slicing_index, x):
+        a1 = 6.5
+        a2 = 2.5
+        
+        tolerance = 0.1 #this value controls how close discharge approximation must be; big number is a rougher approx but faster, small number is better approx but slower
+        jump_factor = 100 #this value controls how quickly we converge on the solution. Big numbers are slower but less likely to hang, smaller numbers are faster but more likely to hang.
+        
+        test_q = 0
+        true_q = self.q[x] #m2/s
+        
         if s <= 0:
             os.system("rm results.out")
             os.system("touch results.out")
             with open("results.out", "a") as f: 
-                f.write('FAIL\n') 
+                f.write('FAIL\n')
             sys.exit("NEGATIVE SLOPE-- KILLING MODEL")
         else:
             pass
-        a1 = 6.5
-        a2 = 2.5
-        coef_1 = (g * s * np.power(a1, 2)) / (np.power(q, 2) * np.power(d, 2))
+        #calculate depth-velocity partitioning without accounting for blocks
+        #so that we get approximate value for h and u even when q ~ tolerance
+        coef_1 = (g * s * np.power(a1, 2)) / (np.power(q, 2) * np.power(z0, 2))
         coef_2 = 0.0
-        coef_3 = -1 / np.power(d, 5 / 3)
+        coef_3 = -1 / np.power(z0, 5 / 3)
         coef_4 = -np.power(a1 / a2, 2)
         coef_array = np.array([coef_1, coef_2, coef_3, coef_4])
-        #print coef_array
         roots = np.roots(coef_array)
         is_real = np.isreal(roots)
-        root = np.real(roots[is_real])[0]
-        #print root        
+        root = np.real(roots[is_real])[0] 
         h = np.power(root, 3 / 5)
         if np.isnan(np.sum(h)):
             print(h)
             sys.exit("NAN FOUND IN ROOT'S H-- KILLING MODEL")
-        #rough_iter = 1
-        #error = 1
-        #while error > tol:
-        #    rough_iter += 1
-        #    if rough_iter > 100000:
-        #        os.system("rm results.out")
-         #       os.system("touch results.out")
-         #       with open("results.out", "a") as f: 
-         #           f.write('FAIL\n')
-         #       print 'real_q = ', q
-         #       print 'slope = ', s
-         #       print 'd = ', d
-         #       print 'h_up = ', h_up
-         #       sys.exit("ROUGHNESS CALCULATION STUCK-- KILLING MODEL")
-         #   else:
-         #       pass
-         #   h_mid = (h_low + h_up)/2
-         #   q_mid = h_mid * np.sqrt(g * h_mid * s) * ((a1 * h_mid / d)) / np.sqrt(np.power(h_mid / d, 5/3) + np.power(a1 / a2, 2))
-         #   error = abs(q_mid - q)
-         #   if q_mid > q and error > tol:
-         #       h_up = h_mid
-         #   elif q_mid < q and error > tol:
-         #       h_low = h_mid
-         #   else:
-         #       pass
-        return h
+        u = true_q / h
+        sigma_d = 0
+        
+        #if np.count_nonzero(self.is_block_in_cell) == 0:
+            
+    	#    #print('discharge: ' + str(true_q))
+    	#    while np.isclose(test_q, true_q, atol=tolerance) == False:
+    	#    	if test_q > true_q:
+    	#    		h -= 0.02
+    	#    	elif test_q < true_q:
+    	#    		h += 0.02
+    	#    	
+    	#    	beta = (a1 * (h / z0)) / np.power(np.power(h / z0, 5 / 3) + np.power(a1 / a2, 2), 1/2)
+    	#    	sigma_d = 0
+    	#    	u = np.power((g * h * s) / (1 + sigma_d), 0.5) * beta
+    	#    	test_q = h * u
+    	
+        if np.count_nonzero(self.is_block_in_cell) != 0:
+    		#print('bisection with blocks')
+    		
+    		
+            avg_diam_blocks = np.average(tracking_mat[0:slicing_index, 1][self.is_block_in_cell])
+            spacing_squared = (dx * self.dy[x]) / np.count_nonzero(self.is_block_in_cell)
+            
+            #calculate an initial discharge value in case it's close enough to skip iterating
+            beta = (a1 * (h / z0)) / np.power(np.power(h / z0, 5 / 3) + np.power(a1 / a2, 2), 1/2)
+            submerged_block = (self.is_block_in_cell) & (tracking_mat[0:slicing_index, 1] < h)
+            emergent_block = (self.is_block_in_cell) & (tracking_mat[0:slicing_index, 1] >= h)
+            tracking_mat[0:slicing_index, 3][submerged_block] = tracking_mat[0:slicing_index, 1][submerged_block]
+            tracking_mat[0:slicing_index, 3][emergent_block] = h
+            avg_submerged_height_blocks = np.average(tracking_mat[0:slicing_index, 3][self.is_block_in_cell])
+            sigma_d = 0.5 * cd * np.power(beta, 2) * (avg_submerged_height_blocks * avg_diam_blocks / spacing_squared)
+            u = np.power((g * h * s) / (1 + sigma_d), 0.5) * beta
+            test_q = h * u
+            
+            while np.isclose(test_q, true_q, atol=tolerance) == False:
+    			#print('test_q: ' + str(test_q))
+    			#print('true_q: ' + str(true_q))
+                #print('cell: ' + str(x))
+                #print('h: ' + str(h))
+                #print('test_q: ' + str(test_q))
+                #print('true_q: ' + str(true_q))
+                #print('--------')
+                if test_q > true_q:
+                    h -= np.abs(test_q - true_q) / jump_factor#(tolerance / 5)
+                    h = np.minimum(h, 0)
+                elif test_q < true_q:
+                    h += np.abs(test_q - true_q) / jump_factor#(tolerance / 5)
+    			
+                beta = (a1 * (h / z0)) / np.power(np.power(h / z0, 5 / 3) + np.power(a1 / a2, 2), 1/2)
+                submerged_block = (self.is_block_in_cell) & (tracking_mat[0:slicing_index, 1] < h)
+                emergent_block = (self.is_block_in_cell) & (tracking_mat[0:slicing_index, 1] >= h)
+                tracking_mat[0:slicing_index, 3][submerged_block] = tracking_mat[0:slicing_index, 1][submerged_block]
+                tracking_mat[0:slicing_index, 3][emergent_block] = h
+                avg_submerged_height_blocks = np.average(tracking_mat[0:slicing_index, 3][self.is_block_in_cell])
+                sigma_d = 0.5 * cd * np.power(beta, 2) * (avg_submerged_height_blocks * avg_diam_blocks / spacing_squared)
+                u = np.power((g * h * s) / (1 + sigma_d), 0.5) * beta
+                test_q = h * u
+                #print('cell: ' + str(x))
+                #print('h: ' + str(h))
+                #print('test_q: ' + str(test_q))
+                #print('true_q: ' + str(true_q))
+                #print('--------')
+    	#print('depth: ' + str(h))
+    	#print('velocity: ' + str(u))
+    	
+        return h, u, sigma_d
     
     def convert_years_to_seconds(self, value):
         value_years = value * 365 * 24 * 3600
@@ -162,7 +212,8 @@ class Brake(object):
         self.incision_memory = np.zeros((mem_timesteps, self.n_cells))
         
     def instantiate_common_constants(self):  
-        np.random.seed(50) #TURN THIS LINE ON TO ELIMINATE INHERENT VARIABILITY
+        self.rg = Generator(PCG64(1234))
+        #np.random.seed(50) #TURN THIS LINE ON TO ELIMINATE INHERENT VARIABILITY
         self.dens_water = 1000 #kg/m^3
         self.dens_sediment = 2650 #kg/m^3
         self.g = 9.81 #acceleration due to gravity (m/s^2)
@@ -187,10 +238,10 @@ class Brake(object):
         self.cell_centers = (cell_indices * dx) + (dx / 2)
         self.upstream_edges_of_cell = self.cell_centers - (dx / 2)
         self.downstream_edges_of_cell = self.cell_centers + (dx / 2)
-        self.surface_elev = -initial_slope * cell_indices * dx + starting_height_adjustment #starting surface elevation (m)
-        #self.surface_elev = np.load('long_prof_3000m_equil.npy') # after run to equilibrium, can upload a longtiduinal profile here
+        #self.surface_elev = -initial_slope * cell_indices * dx + starting_height_adjustment #starting surface elevation (m) SMM: this is what I could change
+        self.surface_elev = np.load('full_8ma_profile_20ky_repeat.npy')
 
-    def instantiate_tracking_matrix(self, number_of_blocks, gamma, starting_dist, fluvial_block_k):
+    def instantiate_tracking_matrix(self, number_of_blocks, gamma, starting_dist, fluvial_block_k):    # SMM: this is what I change for initial distributions
         number_of_blocks = int(number_of_blocks)
         #boulders = int(boulders)
         #cubes = int(cubes)
@@ -233,46 +284,40 @@ class Brake(object):
         self.corrected_tau_array = np.zeros(n_cells, dtype = np.float64)        
         self.time_avg_inc_rate_array = np.zeros(n_cells, dtype = np.float64)
         #self.blocks_in_cells = np.zeros(n_cells, dtype=np.float64)
-        #self.zero_to_one_temp = np.zeros(n_cells, dtype=np.float64)
-        #self.one_to_two_temp = np.zeros(n_cells, dtype=np.float64)
-        #self.two_to_three_temp = np.zeros(n_cells, dtype=np.float64)
-        #self.three_to_four_temp = np.zeros(n_cells, dtype=np.float64)
-        #self.four_to_five_temp = np.zeros(n_cells, dtype=np.float64)
-        #self.five_to_six_temp = np.zeros(n_cells, dtype=np.float64)
+
         self.record_count = 0
         self.slope[:] = initial_slope
         self.old_surf_elev_array[:] = surface_elevation
         self.surface_elev_array[:] = surface_elevation
         
-    def instantiate_record_keeping_arrays(self, time_to_run, record_time_seconds, number_records, n_cells, surface_elev_array, slope):
+    def instantiate_record_keeping_arrays(self, time_to_run, record_time_seconds, number_records, n_cells, surface_elev_array, slope, track_block_sizes):
         number_records = int(number_records)
         self.time_record = np.arange(0, time_to_run + record_time_seconds, record_time_seconds) #records time
         self.surface_elev_record = np.zeros((number_records + 1, n_cells), dtype = np.float64) #records surface elevation
         self.slope_record = np.zeros((number_records + 1, n_cells), dtype = np.float64) #records slope
         self.block_count_record = np.zeros((number_records + 1, n_cells), dtype = np.float64) #records number of blocks in each cell
-        self.mean_block_size_record = np.zeros((number_records + 1, n_cells), dtype = np.float64) #records mean size of blocks in each cell
+        if track_block_sizes == True:
+        	self.block_size_record = [[None] * n_cells for _ in range(number_records + 1)]
+        
         self.cover_frac_record = np.zeros((number_records + 1, n_cells), dtype = np.float64) #records cover fraction
         self.time_avg_inc_rate_record = np.zeros((number_records + 1, n_cells), dtype = np.float64)        
         self.uncorrected_tau_record = np.zeros((number_records + 1, n_cells), dtype = np.float64)
         self.corrected_tau_record = np.zeros((number_records + 1, n_cells), dtype = np.float64)
-        #arrays for grain size
-        #self.zero_to_one = np.zeros((number_records + 1, n_cells), dtype = np.float64)       
-        #self.one_to_two = np.zeros((number_records + 1, n_cells), dtype = np.float64)
-        #self.two_to_three = np.zeros((number_records + 1, n_cells), dtype = np.float64)
-        #self.three_to_four = np.zeros((number_records + 1, n_cells), dtype = np.float64)
-        #self.four_to_five = np.zeros((number_records + 1, n_cells), dtype = np.float64)
-        #self.five_to_six = np.zeros((number_records + 1, n_cells), dtype = np.float64)
+
         #initial values
         self.time_record[0] = 0
         self.surface_elev_record[0, :] = surface_elev_array
-        self.slope_record[0, :] = slope
+        initial_slope = np.zeros(len(self.surface_elev_array))
+        initial_slope[0:-1] = -(self.surface_elev_array[1:] - self.surface_elev_array[0:-1]) / (self.dx)
+        initial_slope[-1] = self.initial_slope #value doesn't matter
+        self.slope_record[0, :] = initial_slope[:]
         
     def instantiate_counting_parameters(self):
         self.time = 0
         self.run_count = 0
         self.blocks = 0
         
-    def calculate_initial_array_values(self, number_of_blocks, x_array, dx, dy, side_length):
+    def calculate_initial_array_values(self, number_of_blocks, x_array, dx, dy, side_length, track_block_sizes):
         self.for_slicing = int(number_of_blocks + 1)
         for x in x_array:
             self.is_block_in_cell = (self.tracking_mat[0:self.for_slicing, 0] >= self.upstream_edges_of_cell[x]) & (self.tracking_mat[0:self.for_slicing, 0] < self.downstream_edges_of_cell[x]) #!
@@ -284,21 +329,18 @@ class Brake(object):
             cover_frac = block_cover / (dx * dy[x]) #how much of cell is COVERED by big bits
             self.cover_frac_array[x] = 1 - np.exp(-cover_frac)
             self.block_count_record[0, x] = num_starting_blocks
-            if np.count_nonzero(self.tracking_mat[0:self.for_slicing, 1][self.is_block_in_cell]) == 0:
-            	self.mean_block_size_record[0, x] = 0
-            else:
-            	self.mean_block_size_record[0, x] = np.average(self.tracking_mat[0:self.for_slicing, 1][self.is_block_in_cell]) #!
+            if track_block_sizes == True:
+                if np.count_nonzero(self.tracking_mat[0:self.for_slicing, 1][self.is_block_in_cell]) == 0:
+                    self.block_size_record[0][x] = np.array([]) #put in empty array if no bocks
+                else:
+                    self.block_size_record[0][x] = self.tracking_mat[0:self.for_slicing, 1][self.is_block_in_cell] #put in array of sizes if there are blocks
             self.cover_frac_record[0, x] = self.cover_frac_array[x]
-            #self.abbrev_track_mat = self.tracking_mat[0:self.for_slicing, :]
-
-        #get rid of nans in mean block size (these occur because of division by 0 in np.average when there are no blocks)
-        #self.mean_block_size_record[0, :][np.isnan(self.mean_block_size_record[self.record_count, :])] = 0
             
     def calc_num_new_blocks(self, x):
         mean_incision_rate = np.mean(self.incision_memory[:, x])
         self.time_avg_inc_rate_array[x] = mean_incision_rate
         lam_rockfall = mean_incision_rate * self.gamma #GAMMA CONTROLS RATE OF BLOCK INPUT
-        num_new_blocks = int(np.random.poisson(lam_rockfall * self.timestep, 1)) #number of new pieces
+        num_new_blocks = int(self.rg.poisson(lam_rockfall * self.timestep, 1)) #number of new pieces
         return num_new_blocks
         
     def track_new_blocks(self, num_new_blocks, x, hillslope_block_k):
@@ -322,7 +364,7 @@ class Brake(object):
             
             self.tracking_mat[next_entry, 4] = hillslope_block_k
 
-        #self.abbrev_track_mat = self.tracking_mat[0:self.for_slicing, :] # should look into tis
+        #self.abbrev_track_mat = self.tracking_mat[0:self.for_slicing, :]
         
     def add_block_deposition_event(self, event_number, depo_blocks_info, fluvial_block_k):
     	#depo_blocks_info is 2n (where n is # of depo events)-column array with col 0 as distance and col 1 as size
@@ -357,17 +399,17 @@ class Brake(object):
             self.tracking_mat[next_entry, 4] = fluvial_block_k
     
     def calc_flow_depth_and_velocity(self, x):
-        h = self.roughness_bisection(self.q[x], self.slope[x], self.z0, self.g)  
+        h, v, sigma_d = self.roughness_bisection(self.q[x], self.slope[x], self.z0, self.g, self.drag_cube, self.tracking_mat, self.dx, self.for_slicing, x)  
         if np.isnan(np.sum(h)):
             print(h)
             sys.exit("NAN FOUND IN FLOW DEPTH-- KILLING MODEL")
-        v = self.q[x] / h
+        #v = self.q[x] / h
         tau_initial = self.dens_water * self.g * h * self.slope[x] #shear stress at each node(Pa)
         self.uncorrected_tau_array[x] = tau_initial  
         if np.isnan(np.sum(self.uncorrected_tau_array)):
             print(self.uncorrected_tau_array)
             sys.exit("NAN FOUND IN UNCORRECTED TAU-- KILLING MODEL")                     
-        tau = self.calc_shear_stress_with_roughness(tau_initial, self.tracking_mat, self.drag_cube, h, self.dx, self.z0, self.for_slicing, x)
+        tau = tau_initial / (1 + sigma_d) #self.calc_shear_stress_with_roughness(tau_initial, self.tracking_mat, self.drag_cube, h, self.dx, self.z0, self.for_slicing, x)
         self.corrected_tau_array[x] = tau
         if np.isnan(np.sum(self.corrected_tau_array)):
             print(self.corrected_tau_array)
@@ -380,10 +422,10 @@ class Brake(object):
     def erode_bed(self, rock_uplift_rate, n_cells):
         #self.surface_elev_array[-1] -= (baselevel_drop * self.timestep) #adjust baselevel node
         excess_tau = self.corrected_tau_array[0:-1] - self.tau_c_br
-        #excess_tau = excess_tau.clip(min=0)
-        #f_open = 1 - self.cover_frac_array[0:-1]
-        #f_open = f_open.clip(min=0)
-        #self.surface_elev_array[0:-1] -= self.ke_br_bed * (excess_tau) * (f_open) * self.timestep
+        excess_tau = excess_tau.clip(min=0)
+        f_open = 1 - self.cover_frac_array[0:-1]
+        f_open = f_open.clip(min=0)
+        self.surface_elev_array[0:-1] -= self.ke_br_bed * (excess_tau) * (f_open) * self.timestep
         #print 'excess tau = ', excess_tau
         #print 'ideal erosion = ', (self.ke_br_bed * (excess_tau) * (f_open) * self.timestep)
         #print baselevel_drop
@@ -394,23 +436,27 @@ class Brake(object):
         #f_open = 1 - self.cover_frac_array
         #f_open = f_open.clip(min=0)
         #self.surface_elev_array[:-1] -= self.ke_br_bed * f_open[:-1] * self.corrected_tau_array[:-1] * self.timestep
-        for cell in range(n_cells - 2, -1, -1):
-            if excess_tau[cell] <= 0:
-                pass #new elev is the same as old b/c no erosion
-            else:
-                f_open = 1 - self.cover_frac_array[cell]  
-                f_open = f_open.clip(min=0)
-                self.surface_elev_array[cell] = (self.surface_elev_array[cell] + \
-                    (self.surface_elev_array[cell + 1] * f_open * self.ke_br_bed * \
-                    self.dens_water * self.g * self.flow_depth[cell] * self.timestep / \
-                    (self.dx * (1 + self.sigma_d_array[cell]))) + (self.timestep * f_open * \
-                    self.ke_br_bed * self.tau_c_br)) / (1 + (f_open * self.ke_br_bed * \
-                    self.dens_water * self.g * self.flow_depth[cell] * self.timestep / \
-                    (self.dx * (1 + self.sigma_d_array[cell]))))
+        
+        #CMS commenting out the kind-of-implicit solution#################
+        #for cell in range(n_cells - 2, -1, -1):
+        #    if excess_tau[cell] <= 0:
+        #        pass #new elev is the same as old b/c no erosion
+        #    else:
+        #        f_open = 1 - self.cover_frac_array[cell]  
+        #        f_open = f_open.clip(min=0)
+        #        self.surface_elev_array[cell] = (self.surface_elev_array[cell] + \
+        #            (self.surface_elev_array[cell + 1] * f_open * self.ke_br_bed * \
+        #            self.dens_water * self.g * self.flow_depth[cell] * self.timestep / \
+        #            (self.dx * (1 + self.sigma_d_array[cell]))) + (self.timestep * f_open * \
+        #            self.ke_br_bed * self.tau_c_br)) / (1 + (f_open * self.ke_br_bed * \
+        #            self.dens_water * self.g * self.flow_depth[cell] * self.timestep / \
+        #            (self.dx * (1 + self.sigma_d_array[cell]))))
+        #################################################################
         if np.isnan(np.sum(self.surface_elev_array)):
             print(self.surface_elev_array)
             sys.exit("NAN FOUND IN ELEV ARRAY-- KILLING MODEL")
-                
+
+
         #print self.surface_elev_array
     def calc_force_balance(self, h, v, x):
         lam_hop = (1. / 365 / 24 / 3600) #average rate of motion = 1 grain diameter per year   
@@ -451,8 +497,9 @@ class Brake(object):
 
         is_moving_block = (total_motion_force > total_resist_force) & (self.is_block_in_cell)
         not_moving_block = (total_motion_force <= total_resist_force) & (self.is_block_in_cell)
-        hop_length[is_moving_block] = np.random.poisson(lam_hop * self.timestep, \
-            sum(1 for x in is_moving_block if x)) * self.tracking_mat[0:self.for_slicing, 1][is_moving_block]#!
+        hop_length[is_moving_block] = self.rg.poisson(lam_hop * self.timestep, \
+            #sum(1 for x in is_moving_block if x)) * self.tracking_mat[0:self.for_slicing, 1][is_moving_block]#! # SMM: edited out 1/16/2023
+            sum(1 for x in is_moving_block if x)) / self.tracking_mat[0:self.for_slicing, 1][is_moving_block] # SMM: inversely scaled to try to make small boulders move more than big boulders
         hop_length[not_moving_block] = 0
         self.tracking_mat[0:self.for_slicing, 0] = self.tracking_mat[0:self.for_slicing, 0] + hop_length #adds hop length to downstream distance #!
         hop_length[:] = 0
@@ -515,7 +562,7 @@ class Brake(object):
         self.old_surf_elev_array[:] = self.surface_elev_array #update old, for incision rate calculations
         
     def display_model_progress(self):
-        if self.run_count == 1 or np.remainder(self.run_count, 1) == 0: # display run count
+        if self.run_count == 1 or np.remainder(self.run_count, 10) == 0:
             print('Run ' + str(self.run_count) + ' of ' + str(self.number_iterations))
             #print(self.blocks)
         else: 
@@ -525,7 +572,7 @@ class Brake(object):
         self.slope[0:-1] = -(self.surface_elev_array[1:] - self.surface_elev_array[0:-1]) / (self.dx)
         self.slope[-1] = self.initial_slope 
         
-    def update_record_keeping_arrays(self):
+    def update_record_keeping_arrays(self, track_block_sizes):
     	self.record_count += 1            
     	self.surface_elev_record[self.record_count, :] = self.surface_elev_array
     	self.slope_record[self.record_count, :] = self.slope
@@ -533,27 +580,18 @@ class Brake(object):
     	self.corrected_tau_record[self.record_count, :] = self.corrected_tau_array
     	self.time_avg_inc_rate_record[self.record_count, :] = self.time_avg_inc_rate_array
     	#self.block_count_record[self.record_count, :] = sum(self.is_block_in_cell)
-    	#self.mean_block_size_record[self.record_count, :] = np.average(self.tracking_mat[0:self.for_slicing, 1][self.is_block_in_cell])
+    	
     	self.cover_frac_record[self.record_count, :] = self.cover_frac_array
     	
     	#spatial loop, needed to do block count and mean size at every cell ONLY DURING RECORDED TIMES
     	for x in self.x_array:
     		self.is_block_in_cell = (self.tracking_mat[0:self.for_slicing, 0] >= self.upstream_edges_of_cell[x]) & (self.tracking_mat[0:self.for_slicing, 0] < self.downstream_edges_of_cell[x]) #!
     		self.block_count_record[self.record_count, x] = sum(self.is_block_in_cell)
-    		if np.count_nonzero(self.tracking_mat[0:self.for_slicing, 1][self.is_block_in_cell]) == 0:
-    			self.mean_block_size_record[self.record_count, x] = 0
-    		else:
-    			self.mean_block_size_record[self.record_count, x] = np.average(self.tracking_mat[0:self.for_slicing, 1][self.is_block_in_cell]) #!
-    		#self.mean_block_size_record[self.record_count, x] = np.average(self.tracking_mat[0:self.for_slicing, 1][self.is_block_in_cell])
-    		
-    	#get rid of nans in mean block size (these occur because of division by 0 in np.average when there are no blocks)
-    	#self.mean_block_size_record[self.record_count, :][np.isnan(self.mean_block_size_record[self.record_count, :])] = 0
-        
-        #self.one_to_two[self.record_count, :] = self.one_to_two_temp
-        #self.two_to_three[self.record_count, :] = self.two_to_three_temp
-        #self.three_to_four[self.record_count, :] = self.three_to_four_temp
-        #self.four_to_five[self.record_count, :] = self.four_to_five_temp
-        #self.five_to_six[self.record_count, :] = self.five_to_six_temp
+    		if track_block_sizes == True:
+    		    if np.count_nonzero(self.tracking_mat[0:self.for_slicing, 1][self.is_block_in_cell]) == 0:
+    			    self.block_size_record[self.record_count][x] = np.array([]) #put in empty array if no bocks
+    		    else:
+    			    self.block_size_record[self.record_count][x] = self.tracking_mat[0:self.for_slicing, 1][self.is_block_in_cell] #put in array of sizes if there are blocks
         
     def delete_eroded_or_gone_blocks(self):
         #now find and delete any tracking rows where blocks have degraded to 0.
@@ -615,7 +653,11 @@ class Brake(object):
         return (total_volume_lost, final_max_elevation, final_mean_elevation,
             final_stdev_elevation, final_max_slope, final_mean_slope, final_stdev_slope, total_blocks)    
     
-    def initialize(self, time_to_run_yrs, timestep_yrs, record_time_int, imposed_rock_uplift_rate, delay_timescale, gamma, n_cells, dx, side_length, bed_k, hillslope_block_k, fluvial_block_k, z0, tau_c, depo_blocks_info, depo_events_timing, chan_width, k_w, hack_c, hack_exp):
+    def check_equil(self, last_elev, second_to_last_elev):
+        if np.isclose(last_elev, second_to_last_elev, atol=0.001):
+            print("~~~~~~~Equilibrium Reached~~~~~~~")
+
+    def initialize(self, time_to_run_yrs, timestep_yrs, record_time_int, imposed_rock_uplift_rate, delay_timescale, gamma, n_cells, dx, side_length, bed_k, hillslope_block_k, fluvial_block_k, z0, tau_c, depo_blocks_info, depo_events_timing, chan_width, k_w, hack_c, hack_exp, track_block_sizes):
         #inputs
         self.n_cells = n_cells #number of cells
         self.dx = dx #cell side length (m)
@@ -651,7 +693,7 @@ class Brake(object):
         self.instantiate_single_dt_arrays(self.n_cells, self.initial_slope, self.surface_elev)
         
         #instantiate record-keeping arrays
-        self.instantiate_record_keeping_arrays(self.time_to_run, self.record_time_seconds, self.number_records, self.n_cells, self.surface_elev_array, self.slope)
+        self.instantiate_record_keeping_arrays(self.time_to_run, self.record_time_seconds, self.number_records, self.n_cells, self.surface_elev_array, self.slope, track_block_sizes)
         
         #set roughness calculation parameters (for roughness generated by bed, not boulders)
         self.set_roughness_depth_calc_params(z0)        
@@ -661,9 +703,11 @@ class Brake(object):
         self.instantiate_counting_parameters()
 
         #calculate initial values of arrays such as block_count_record and cover_frac_record
-        self.calculate_initial_array_values(number_of_blocks, self.x_array, self.dx, self.dy, self.cube_side_length)        
+        self.calculate_initial_array_values(number_of_blocks, self.x_array, self.dx, self.dy, self.cube_side_length, track_block_sizes)        
         self.extra_q_iterator = 0 #instantiate here
-    def update(self, weibull_k, weibull_scale, hillslope_block_k, fluvial_block_k, depo_blocks_info, depo_events_timing, area_0, hack_c, hack_exp):
+
+        self.check_equil(self.surface_elev[-1], self.surface_elev[-2])
+    def update(self, weibull_k, weibull_scale, hillslope_block_k, fluvial_block_k, depo_blocks_info, depo_events_timing, area_0, hack_c, hack_exp, track_block_sizes):
         #from cfuncs import calc_num_new_blocks 
         self.time += self.timestep
         self.run_count += 1
@@ -674,7 +718,8 @@ class Brake(object):
         #weibull_mean = 10.0#15.0384 #m3/s discharge at orodell gauge
         #weibull_k = 0.5 #unitless, c in Rossi et al (2016)
         #weibull_scale = 5.0#16.94664 #calc'ed outside with sp.special.gamma()
-        q_volume = weibull_scale * np.random.weibull(weibull_k) #Q at left hand side
+        q_volume = weibull_scale * self.rg.weibull(weibull_k) #Q at left hand side
+        #print('q volume: ' + str(q_volume))
         r = q_volume / area_0 #get runoff
         self.area_array = area_0 + np.power(self.x_increase_from_left / hack_c, 1 / hack_exp)
         self.q = (r * self.area_array) / self.dy
@@ -737,34 +782,34 @@ class Brake(object):
 
         #update record keeping arrays   
         if np.remainder(self.run_count, (self.record_time_int / self.timestep_yrs)) == 0: #
-            self.update_record_keeping_arrays()
+            self.update_record_keeping_arrays(track_block_sizes)
         else:
             pass
         
         self.delete_eroded_or_gone_blocks()
         
-    def finalize(self, suffix):
+    def finalize(self, suffix, track_block_sizes):
         #once everything has run, spit out arrays as .npy binaries
         #print self.blocks
         np.save('time_record_' + suffix, self.time_record)
         np.save('elev_record_' + suffix, self.surface_elev_record)
         np.save('slope_record_' + suffix, self.slope_record)
         np.save('block_count_record_' + suffix, self.block_count_record)
-        np.save('mean_block_size_record_' + suffix, self.mean_block_size_record)
         np.save('cover_frac_record_' + suffix, self.cover_frac_record)
         np.save('time_avg_inc_rate_record_' + suffix, self.time_avg_inc_rate_record)
         np.save('uncorrected_tau_record_' + suffix, self.uncorrected_tau_record)
         np.save('corrected_tau_record_' + suffix, self.corrected_tau_record)
-        #np.save('zero_to_one_' + suffix, self.zero_to_one)
-        #np.save('one_to_two_' + suffix, self.one_to_two)
-        #np.save('two_to_three_' + suffix, self.two_to_three)
-        #np.save('three_to_four_' + suffix, self.three_to_four)
-        #np.save('four_to_five_' + suffix, self.four_to_five)
-        #np.save('five_to_six_' + suffix, self.five_to_six)
+        
+        #CMS October 2022 edit: save out drainage area
+        np.save('drainage_area_array_' + suffix, self.area_array)
+        if track_block_sizes == True:
+            with open('block_size_record_' + suffix + '.p', 'wb') as fp:
+                pickle.dump(self.block_size_record, fp)
         
     ##############################################################################
-    def run_model(self, time_to_run, timestep, record_time_int, imposed_rock_uplift_rate, delay_timescale, gamma, side_length, suffix, n_cells, dx, bed_k, hillslope_block_k, fluvial_block_k, z_0, tau_c, weibull_k, weibull_scale, depo_blocks_info, depo_events_timing, chan_width, k_w, hack_c, hack_exp, area_0):
-        self.initialize(time_to_run, timestep, record_time_int, imposed_rock_uplift_rate, delay_timescale, gamma, n_cells, dx, side_length, bed_k, hillslope_block_k, fluvial_block_k, z_0, tau_c, depo_blocks_info, depo_events_timing, chan_width, k_w, hack_c, hack_exp)
+    def run_model(self, time_to_run, timestep, record_time_int, imposed_rock_uplift_rate, delay_timescale, gamma, side_length, suffix, n_cells, dx, bed_k, hillslope_block_k, fluvial_block_k, z_0, tau_c, weibull_k, weibull_scale, depo_blocks_info, depo_events_timing, chan_width, k_w, hack_c, hack_exp, area_0, track_block_sizes):
+        self.initialize(time_to_run, timestep, record_time_int, imposed_rock_uplift_rate, delay_timescale, gamma, n_cells, dx, side_length, bed_k, hillslope_block_k, fluvial_block_k, z_0, tau_c, depo_blocks_info, depo_events_timing, chan_width, k_w, hack_c, hack_exp, track_block_sizes)
         while self.time < self.time_to_run:
-            self.update(weibull_k, weibull_scale, hillslope_block_k, fluvial_block_k, depo_blocks_info, depo_events_timing, area_0, hack_c, hack_exp)
-        self.finalize(suffix)
+            self.update(weibull_k, weibull_scale, hillslope_block_k, fluvial_block_k, depo_blocks_info, depo_events_timing, area_0, hack_c, hack_exp, track_block_sizes)
+            #print(self.time)
+        self.finalize(suffix, track_block_sizes)
